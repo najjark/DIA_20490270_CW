@@ -4,17 +4,9 @@ This is a reinforcement learning-based trading bot built using Python, Gymnasium
 The bot uses the Soft Actor-Critic (SAC) algorithm to learn profitable trading strategies while handling multiple stocks.
 
 It includes features like:
-- Multi-asset support (e.g., Apple, Microsoft, Tesla)
-- Sentiment-aware decision-making using FinBERT and news data
+- Support for multiple assets (e.g., Apple, Microsoft, Tesla)
+- Decision making using sentiment and price data using FinBERT and historical stock prices
 - Stop-loss and take-profit logic
 - Transaction cost simulation
 - Customizable training and evaluation
-
-## Features
-
-- Soft Actor-Critic RL algorithm  
-- Technical indicators (RSI, MACD, Moving Averages)
-- NLP-based sentiment analysis from news (FinBERT)  
-- Stop-loss / Take-profit logic
-- Portfolio management and reward scaling  
-- Backtesting and visualization tools  
+- Backtesting and visualization tools
