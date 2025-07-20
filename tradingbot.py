@@ -813,6 +813,21 @@ def make_env(df, sentiment_df, initial_balance, window_size, stop_loss, take_pro
     return _init
 
 def objective(trial, train_df, train_sentiment_df, test_df, test_sentiment_df):
+    """
+    Objective function for Optuna to optimize SAC hyperparameters.
+
+    Args:
+        trial: Optuna trial object to suggest hyperparameters
+        train_df: Training price data
+        train_sentiment_df: Training sentiment data
+        test_df: Testing price data
+        test_sentiment_df: Testing sentiment data
+
+    Returns:
+        Total return (%) on test data from the backtested trained model
+    """
+    
+    # suggest hyperparameters using Optuna's search space
     learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
     batch_size = trial.suggest_categorical("batch_size", [64, 128, 256, 512])
     buffer_size = trial.suggest_categorical("buffer_size", [10000, 50000, 100000])
@@ -821,12 +836,14 @@ def objective(trial, train_df, train_sentiment_df, test_df, test_sentiment_df):
     tau = trial.suggest_float("tau", 0.001, 0.02, log=True)
     train_freq = trial.suggest_int("train_freq", 1, 10)
 
+    # create a vectorized training environment
     env = make_vec_env(
         make_env(train_df, train_sentiment_df, 10000, 20, 0.03, 0.06),
         n_envs=4,
         vec_env_cls=SubprocVecEnv
     )
 
+    # initialize the SAC model with the trial's suggested hyperparameters
     model = SAC(
         "MlpPolicy",
         env,
@@ -843,35 +860,59 @@ def objective(trial, train_df, train_sentiment_df, test_df, test_sentiment_df):
         tensorboard_log="./tensorboard_logs/"
     )
 
+    # set training callbacks
     callbacks = [TensorboardCallback(), EarlyStoppingCallback(check_freq=500, reward_threshold=100, patience=1000)]
+
+    # train the model for the number of timesteps defined
     model.learn(total_timesteps=200000, callback=callbacks, progress_bar=False)
 
+    # evaluate the trained model on the test environment
     test_env = StockTradingEnv(test_df, test_sentiment_df, 10000, 20, 0.03, 0.06)
+    
     portfolio_values, _ = backtest_model(model, test_env, test_df, test_sentiment_df, output_folder=f'backtest_results_trial_{trial.number}')
 
+    # calculate total return over the test period
     initial_value = test_env.initial_balance
     final_value = portfolio_values[-1]
     total_return = (final_value / initial_value - 1) * 100
 
     return total_return
 
-# function to optimimze hyperparameters
 def optimize_hyperparameters(train_df, train_sentiment_df, test_df, test_sentiment_df, n_trials=0):
+    """
+    Runs Optuna to find the best SAC hyperparameters, trains the final model, and backtests it.
+
+    Args:
+        train_df: Training price data
+        train_sentiment_df: Training sentiment data
+        test_df: Testing price data
+        test_sentiment_df: Testing sentiment data
+        n_trials: Number of Optuna trials to run
+
+    Returns:
+        None (prints results and saves backtest)
+    """
+
+    # create an Optuna study to maximize total return
     study = optuna.create_study(direction="maximize")
+
+    # optimize the objective function
     study.optimize(lambda trial: objective(trial, train_df, train_sentiment_df, test_df, test_sentiment_df), n_trials=n_trials, show_progress_bar=True)
 
+    # print the best results
     print("Best hyperparameters: ", study.best_params)
     print("Best total return: ", study.best_value)
 
     best_params = study.best_params
 
+    # create training environmemt using best hyperparameters
     env = make_vec_env(
         make_env(train_df, train_sentiment_df, 10000, 20, 0.03, 0.06),
         n_envs=4,
         vec_env_cls=SubprocVecEnv
     )
 
-    # configuring the model
+    # reinitialize and train the final model with best parameters
     model = SAC(
         "MlpPolicy",
         env,
@@ -887,15 +928,22 @@ def optimize_hyperparameters(train_df, train_sentiment_df, test_df, test_sentime
         gradient_steps=1,
         tensorboard_log="./tensorboard_logs/"
     )
+    
     callbacks = [TensorboardCallback(), EarlyStoppingCallback(check_freq=500, reward_threshold=100, patience=1000)]
+    
     model.learn(total_timesteps=200000, callback=callbacks, progress_bar=True)
 
+    # evaluate and save results on the test environment
     test_env = StockTradingEnv(test_df, test_sentiment_df, 10000, 20, 0.03, 0.06)
     backtest_model(model, test_env, test_df, test_sentiment_df, output_folder='backtest_results_final')
 
-# main function to run the code
 def main():
-    # define stocks that the bot will trade
+    """
+    Entry point of the program.
+    Fetches training and testing data, runs optimization, and saves results.
+    """
+    
+    # define stocks to trade
     tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN']
 
     # time period for training the model
@@ -906,15 +954,18 @@ def main():
     testing_start_date = '2024-01-01'
     testing_end_date = '2024-12-31'
 
+    # fetch stock price and sentiment data for training
     print("Fetching training data...")
     train_df = fetch_stock_data(tickers, training_start_date, training_end_date)
     train_sentiment_df = fetch_sentiment_data(tickers, train_df, finnhub_key)
     print(train_sentiment_df.describe())
 
+    # fetch stock price and sentiment data for testing
     print("Fetching testing data...")
     test_df = fetch_stock_data(tickers, testing_start_date, testing_end_date)
     test_sentiment_df = fetch_sentiment_data(tickers, test_df, finnhub_key)
 
+    # run hyperparameter optimization and model training
     print("Optimizing hyperparameters...")
     optimize_hyperparameters(train_df, train_sentiment_df, test_df, test_sentiment_df, n_trials=5)
 
