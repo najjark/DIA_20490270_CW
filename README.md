@@ -10,3 +10,9 @@ It includes features like:
 - Transaction cost simulation
 - Customizable training and evaluation
 - Backtesting and visualization tools
+
+# API Key Setup
+
+This bot uses the Finnhub module to retreive news headlines for each stock, you will need to use your own FinnHub API key for it to work.
+
+You may use your API key in Line 26 of the code.
