@@ -21,14 +21,18 @@ from collections import defaultdict
 import optuna
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
-finnhub_key = 'cvuecu9r01qjg1399iq0cvuecu9r01qjg1399iqg'
 
+# FinnHub API key for news data (replace with your actual key)
+finnhub_key = 'FinnHub_KEY'
+
+# initialize FinBERT sentiment analysis pipeline
 sentiment_pipeline = pipeline(
     "text-classification", 
     model="yiyanghkust/finbert-tone",
     device=0 if torch.cuda.is_available() else -1
 )
 
+# custom Gym environment allowing the bot to trade utilising sentiment analysis
 class StockTradingEnv(gym.Env):
     def __init__(self, df, sentiment_df, initial_balance=10000, window_size=20, stop_loss=0.03, take_profit=0.06):
         super().__init__()
@@ -77,25 +81,47 @@ class StockTradingEnv(gym.Env):
         return obs.astype(np.float32)
 
     def _take_action(self, actions):
+        """
+        Execute trading actions based on agent's decisions.
+        
+        Args:
+            actions: Array of continuous values [-1, 1] for each stock
+                    Positive values = buy, negative values = sell
+        
+        Returns:
+            reward: Immediate reward for this action
+            info: Dictionary with trade information
+        """
         reward = 0
         info = {'trades': []}
         current_date = self.df.index[self.current_step]
+
+        # process each stock
         for i, ticker in enumerate(self.tickers):
             action = actions[i]
             current_price = self.df.iloc[self.current_step][(ticker, "Close")]
             current_position = self.positions[ticker]
             transaction_cost = 0.001
             sentiment = self.sentiment_df.iloc[self.current_step][ticker]
+
+            # modify action based on sentiment, strong sentiment amplifies the action
             action = action * (1 + np.sign(action) * 0.2 * np.tanh(sentiment * 3))
 
+            # ensurr action stays within bounds
             action = max(min(action, 1), -1)
+
+            #  buying logic
             if action > 0:
+                # calculate maximum expenditure based on position size limit
                 max_expenditure = self.balance * self.max_position_size * action
                 shares_to_buy = max_expenditure / current_price
+                
                 if shares_to_buy > 0:
                     cost = shares_to_buy * current_price * (1 + transaction_cost)
                     self.balance -= cost
                     self.positions[ticker] += shares_to_buy
+
+                    # update cost basis (average cost of all shares)
                     if current_position > 0:
                         self.cost_basis[ticker] = (
                             (current_position * self.cost_basis[ticker]) + 
@@ -111,16 +137,24 @@ class StockTradingEnv(gym.Env):
                             'sentiment_affected': abs(sentiment) > 0.2
                         })
                             
-                            
+                    # record transaction  
                     info['trades'].append(f"Buy {shares_to_buy:.2f} shares of {ticker} at ${current_price:.2f}")
+
+            # sell logic
             elif action < 0 and current_position > 0:
+                # sell portion of position based on action magnitude
                 shares_to_sell = current_position * abs(action)
+                
                 if shares_to_sell > 0:
                     sale_amount = shares_to_sell * current_price * (1 - transaction_cost)
                     self.balance += sale_amount
                     self.positions[ticker] -= shares_to_sell
+
+                    # calculate profit/loss
                     profit = (current_price - self.cost_basis[ticker]) * shares_to_sell
-                    reward += profit / self.initial_balance                    
+                    reward += profit / self.initial_balance
+
+                    # record transaction
                     self.transactions.append({
                         'step': self.current_step, 'ticker': ticker,
                         'action': 'sell', 'shares': shares_to_sell,
@@ -131,12 +165,17 @@ class StockTradingEnv(gym.Env):
                             
                             
                     info['trades'].append(f"Sell {shares_to_sell:.2f} shares of {ticker} at ${current_price:.2f}, profit: ${profit:.2f}")
+
+            # risk management: stop-loss and take-profit
             if current_position > 0:
                 price_change = (current_price / self.cost_basis[ticker]) - 1
+
+                # stop-loss: sell if loss exceeds threshold
                 if price_change < -self.stop_loss:
                     sale_amount = current_position * current_price
                     profit = (current_price - self.cost_basis[ticker]) * current_position
                     self.balance += sale_amount
+                    
                     self.transactions.append({
                         'step': self.current_step, 'ticker': ticker,
                         'action': 'stop_loss', 'shares': current_position,
@@ -144,23 +183,28 @@ class StockTradingEnv(gym.Env):
                         'sentiment': sentiment,
                         'sentiment_affected': abs(sentiment) > 0.2
                     })
+
+                    # apply a penalty for stop loss
                     reward += profit / self.initial_balance - 0.001
                     self.positions[ticker] = 0
                     self.cost_basis[ticker] = 0
                     info['trades'].append(f"STOP-LOSS: Sell {current_position:.2f} shares of {ticker} at ${current_price:.2f}")
+
+                # take-profit: sell if gain exceeds threshold
                 elif price_change > self.take_profit:
                     sale_amount = current_position * current_price
                     profit = (current_price - self.cost_basis[ticker]) * current_position
                     self.balance += sale_amount
+                    
                     self.transactions.append({
                         'step': self.current_step, 'ticker': ticker,
                         'action': 'take_profit', 'shares': current_position,
                         'price': current_price, 'profit': profit,
-                        
-                        
                         'sentiment': sentiment,
                         'sentiment_affected': abs(sentiment) > 0.2
                     })
+
+                    # give a bonus for take-profit
                     reward += profit / self.initial_balance + 0.002
                     self.positions[ticker] = 0
                     self.cost_basis[ticker] = 0
@@ -168,34 +212,71 @@ class StockTradingEnv(gym.Env):
         return reward, info
 
     def step(self, action):
+        """
+        Execute one time step within the environment.
+        
+        Args:
+            action: Action taken by the agent
+            
+        Returns:
+            observation: Next state observation
+            reward: Reward for this step
+            done: Whether episode is finished
+            truncated: Whether episode was truncated
+            info: Additional information
+        """
+
+        # calculate current portfolio value
         portfolio_value = self.balance
         for ticker in self.tickers:
             if self.current_step < len(self.df):
                 current_price = self.df.iloc[self.current_step][(ticker, "Close")]
                 portfolio_value += self.positions[ticker] * current_price
+
+        # execute trades and get immediate reward
         reward, info = self._take_action(action)
+
+        # move to next step
         self.current_step += 1
+
+        # calculate portfolio performance reward
         portfolio_change = (portfolio_value / self.portfolio_value - 1) * 10
+
+        # add tranasction cost penalty
         transaction_penalty = sum(t['cost'] * 0.001 for t in self.transactions[-len(self.tickers):] if t['action'] == 'buy') / self.initial_balance
+        
+        # final reward combines portfolio change and transaction costs
         reward = portfolio_change - transaction_penalty
+
+        # update portfolio value tracking
         self.portfolio_value = portfolio_value
+
+        # check if episode is done
         done = self.current_step >= len(self.df) - 1
+
+        # get next observation
         obs = self._next_observation()
         info = {'portfolio_value': portfolio_value}
+        
         return obs, reward, done, False, info
 
     def reset(self, seed=None, options=None):
+        """Reset the environment to initial state."""
         super().reset(seed=seed)
+
+        # reset all state variables
         self.balance = self.initial_balance
         self.positions = {ticker: 0 for ticker in self.tickers}
         self.cost_basis = {ticker: 0 for ticker in self.tickers}
         self.current_step = self.window_size - 1
         self.portfolio_value = self.initial_balance
         self.transactions = []
+        
         obs = self._next_observation()
         return obs, {}
 
     def get_portfolio_value(self):
+        """Calculate current total portfolio value (cash + positions)."""
         portfolio_value = self.balance
         for ticker in self.tickers:
             if self.current_step < len(self.df):
@@ -204,6 +285,8 @@ class StockTradingEnv(gym.Env):
         return portfolio_value
 
 class TensorboardCallback(BaseCallback):
+    """Callback to log training metrics to Tensorboard."""
+    
     def __init__(self, verbose=0):
         super().__init__(verbose)
         self.rewards = []
@@ -214,7 +297,15 @@ class TensorboardCallback(BaseCallback):
         return True
 
 class EarlyStoppingCallback(BaseCallback):
+    """Callback to implement early stopping based on performance."""
     def __init__(self, check_freq=1000, reward_threshold=100, patience=5000, verbose=0):
+        """
+        Args:
+            check_freq: How often to check for early stopping
+            reward_threshold: Reward threshold to stop training
+            patience: Number of steps to wait without improvement
+        """
+        
         super().__init__(verbose)
         self.check_freq = check_freq
         self.reward_threshold = reward_threshold
@@ -224,61 +315,122 @@ class EarlyStoppingCallback(BaseCallback):
         self.rewards = []
 
     def _on_step(self):
+        """Check if training should be stopped early."""
+
+        # check performance over last 100 episodes
         if self.n_calls % self.check_freq == 0:
             if 'episode' in self.locals and self.locals['done']:
                 self.rewards.append(self.locals['episode_reward'])
+                
                 if len(self.rewards) >= 100:
                     mean_reward = np.mean(self.rewards[-100:])
+                    
                     if mean_reward > self.best_mean_reward:
                         self.best_mean_reward = mean_reward
                         self.no_improvement_steps = 0
                     else:
                         self.no_improvement_steps += self.check_freq
+
+                    # stop of threshold reached or no improvement for too long
                     if mean_reward >= self.reward_threshold or self.no_improvement_steps >= self.patience:
                         return False
         return True
 
 def fetch_stock_data(tickers, start_date, end_date):
+    """
+    Fetch historical stock data from Yahoo Finance.
+    
+    Args:
+        tickers: List of stock symbols
+        start_date: Start date for data
+        end_date: End date for data
+        
+    Returns:
+        DataFrame with MultiIndex columns (ticker, OHLCV)
+    """
+    
     all_data = {}
+    
     for ticker in tickers:
         try:
             data = yf.download(ticker, start=start_date, end=end_date)
             if data.empty:
                 raise ValueError(f"No data for {ticker}")
+            
             data.columns = [col[0] for col in data.columns]
+
+            # Create MultiIndex columns (ticker, metric)
             renamed_columns = [(ticker, col) for col in data.columns]
             data.columns = pd.MultiIndex.from_tuples(renamed_columns)
+            
             all_data[ticker] = data
+            
         except Exception as e:
             print(f"Error fetching {ticker}: {e}")
             return None
+            
+    # combine all data and handle missing values
     result = pd.concat(all_data.values(), axis=1).ffill().dropna()
     return result
 
 def finbert_sentiment(text):
+    """
+    Analyze sentiment of financial text using FinBERT.
+    
+    Args:
+        text: Text to analyze
+        
+    Returns:
+        Float sentiment score between -1 (negative) and 1 (positive)
+    """
+    
     try:
+        # handle empty or invalid text
         if text is None or pd.isna(text) or str(text).strip() == "":
             return 0.0
+
+        # limit text length (FinBERT has 512 token limit)
         result = sentiment_pipeline(str(text)[:512], return_all_scores=True)
+        
         if not result:
             print(f"No result from FinBERT for text: {text[:50]}...")
             return 0.0
+
+        # extract probabilities for each sentiment class
         probas = {s['label'].lower(): s['score'] for s in result[0]}
         positive = probas.get('positive', 0)
         negative = probas.get('negative', 0)
         neutral = probas.get('neutral', 0)
+
+        # create weighted sentiment score
         weighted_score = (
             (positive * (0.3 + 0.7*positive)) +
             (negative * (-0.3 - 0.7*negative)) +
             (neutral * (neutral - 0.5) * 0.6)
         )
+
+        # apply tanh to bound between -1 and 1
         final_score = np.tanh(weighted_score * 1.5)
         return float(final_score)
+        
     except Exception as e:
         print(f"Sentiment error: {e}")
         return 0.0
 
-def fetch_finnhub_news(ticker, start_date, end_date, api_key):    
+def fetch_finnhub_news(ticker, start_date, end_date, api_key):
+    """
+    Fetch news articles for a specific stock from FinnHub API.
+    
+    Args:
+        ticker: Stock symbol
+        start_date: Start date (YYYY-MM-DD)
+        end_date: End date (YYYY-MM-DD)
+        api_key: FinnHub API key
+        
+    Returns:
+        List of processed news articles
+    """
+    
     url = f'https://finnhub.io/api/v1/company-news'
     params = {
         'symbol': ticker,
@@ -298,11 +450,17 @@ def fetch_finnhub_news(ticker, start_date, end_date, api_key):
 
         processed_news = []
         filtered_count = 0
+
+        # process each news article
         for item in news_data:
+            # filter out articles with poor headlines
             if not item.get('headline') or len(item.get('headline', '')) <= 10:
                 filtered_count += 1
                 continue
+
+            # convert timestamp to date
             date = datetime.datetime.fromtimestamp(item['datetime']).date()
+            
             processed_news.append({
                 'date': date,
                 'ticker': ticker,
@@ -312,8 +470,10 @@ def fetch_finnhub_news(ticker, start_date, end_date, api_key):
                 'url': item.get('url', ''),
                 'raw_data': item
             })
+            
         print(f"Filtered out {filtered_count} news items due to invalid headline")
         print(f"Found {len(processed_news)} news items for {ticker}")
+        
         return processed_news
         
     except Exception as e:
@@ -321,20 +481,35 @@ def fetch_finnhub_news(ticker, start_date, end_date, api_key):
         return []
 
 def fetch_sentiment_data(tickers, stock_df, api_key):
+    """
+    Fetch and process sentiment data for all tickers.
+    
+    Args:
+        tickers: List of stock symbols
+        stock_df: Stock price DataFrame for date alignment
+        api_key: FinnHub API key
+        
+    Returns:
+        DataFrame with sentiment scores for each ticker
+    """
+    
     start_date = stock_df.index.min().strftime('%Y-%m-%d')
     end_date = stock_df.index.max().strftime('%Y-%m-%d')
     print(f"Fetching sentiment data from {start_date} to {end_date}")
-    sentiment_df = pd.DataFrame(0, index=stock_df.index, columns=tickers)
 
+    # initialize sentiment DataFrame with zeros
+    sentiment_df = pd.DataFrame(0, index=stock_df.index, columns=tickers)
     sample_headlines = []
 
+    # define terms to filter relevant news for each stock
     related_terms = {
         'AAPL': ['apple', 'iphone', 'ipad', 'macbook', 'ios','airpods','mac', 'app store'],
         'MSFT': ['microsoft', 'windows', 'azure', 'office', 'xbox', 'teams', 'bing'],
         'AMZN': ['amazon', 'aws', 'prime', 'kindle', 'alexa', 'whole foods', 'bezos'],
         'GOOGL': ['google', 'alphabet', 'android', 'youtube', 'gmail', 'cloud']
     }
-    
+
+    # Process each ticker
     for ticker in tickers:
         print(f"\nProcessing sentiment for {ticker}")
         news_items = fetch_finnhub_news(ticker, start_date, end_date, api_key)
@@ -346,24 +521,29 @@ def fetch_sentiment_data(tickers, stock_df, api_key):
         valid_news_count = 0
         irrelevant_news_count = 0
 
+        # process each news article
         for item in news_items:
             try:
                 date = pd.to_datetime(item['date']).date()
                 nearest_date = stock_df.index[stock_df.index.get_indexer([pd.Timestamp(date)], method='nearest')[0]]
 
+                # filter for relevance to the specific stock
                 headline = item['headline'].lower()
                 summary = item.get('summary', '').lower()
                 if not any(term in headline or term in summary for term in related_terms[ticker]):
                     irrelevant_news_count += 1
                     continue
-                
+
+                # combine headline and summary for sentiment analysis
                 text = f"{item['headline']}. {item.get('summary', '')}"
                 if not text.strip():
                     continue
-                    
+
+                # calculate sentiment score
                 sentiment = finbert_sentiment(text)
                 daily_scores[nearest_date].append(sentiment)
 
+                # store sample headlines for inspection
                 if valid_news_count < 5:
                     sample_headlines.append({
                         'ticker': ticker,
@@ -374,10 +554,11 @@ def fetch_sentiment_data(tickers, stock_df, api_key):
                     })
                 
                 valid_news_count += 1
+                
             except Exception as e:
                 print(f"Error processing news item: {e}")
                 continue
-
+        # display sample headlines for quality check
         print(f"\nSample headlines for {ticker}:")
         for hl in [h for h in sample_headlines if h['ticker'] == ticker]:
             print(f"Date: {hl['date']}")
@@ -389,6 +570,7 @@ def fetch_sentiment_data(tickers, stock_df, api_key):
         for date, scores in daily_scores.items():
             sentiment_df.loc[date, ticker] = max(scores, key=abs) if scores else 0
 
+        # handle missing sentiment with synthetic sentiment
         for date in sentiment_df.index:
             if not daily_scores[date]:
                 try:
@@ -396,7 +578,11 @@ def fetch_sentiment_data(tickers, stock_df, api_key):
                     if prev_idx >= 0:
                         prev_date = stock_df.index[prev_idx]
                         price_change = (stock_df.loc[date, (ticker, 'Close')] / stock_df.loc[prev_date, (ticker, 'Close')] - 1) * 100
+
+                        # convert price change to synthetic sentiment
                         synthetic_sentiment = np.tanh(price_change / 5)
+
+                        # add small random noise
                         synthetic_sentiment += np.random.normal(0, 0.05)
                         synthetic_sentiment = np.clip(synthetic_sentiment, -1, 1)
                         sentiment_df.loc[date, ticker] = synthetic_sentiment
@@ -405,6 +591,7 @@ def fetch_sentiment_data(tickers, stock_df, api_key):
                 except Exception as e:
                     sentiment_df.loc[date, ticker] = sentiment_df[ticker].iloc[:stock_df.index.get_loc(date)].mean() if stock_df.index.get_loc(date) > 0 else 0
 
+        # display sentiment statistics
         print(f"Sentiment score distribution for {ticker}:")
         scores = [score for scores in daily_scores.values() for score in scores] + \
                  [sentiment_df.loc[date, ticker] for date in sentiment_df.index if not daily_scores[date]]
@@ -423,7 +610,19 @@ def fetch_sentiment_data(tickers, stock_df, api_key):
     return sentiment_df
 
 def plot_sentiment_vs_price(ticker, stock_df, sentiment_df, output_folder='results'):
+    """
+    Create visualization comparing stock price and sentiment over time.
+    
+    Args:
+        ticker: Stock symbol to plot
+        stock_df: Price data
+        sentiment_df: Sentiment data
+        output_folder: Directory to save plots
+    """
+    
     plt.figure(figsize=(15, 7))
+
+    # normalize price data for comparison with sentiment
     close_prices = stock_df[(ticker, "Close")]
     normalized_prices = (close_prices - close_prices.min()) / (close_prices.max() - close_prices.min())
     plt.plot(stock_df.index, normalized_prices, label=f'{ticker} Normalized Price', color='blue')
@@ -439,6 +638,20 @@ def plot_sentiment_vs_price(ticker, stock_df, sentiment_df, output_folder='resul
     plt.close()
 
 def backtest_model(model, env, test_df, test_sentiment_df, output_folder='results'):
+    """
+    Backtest the trained model and generate visualizations.
+    
+    Args:
+        model: trained RL model
+        env: Trading environment
+        test_df: Test price data
+        test_sentiment_df: Test sentiment data
+        output_folder: Directory for saving results
+        
+    Returns:
+        portfolio value over backtesting period
+    """
+    
     os.makedirs(output_folder, exist_ok=True)
     env.df = test_df
     env.sentiment_df = test_sentiment_df
@@ -642,6 +855,7 @@ def objective(trial, train_df, train_sentiment_df, test_df, test_sentiment_df):
 
     return total_return
 
+# function to optimimze hyperparameters
 def optimize_hyperparameters(train_df, train_sentiment_df, test_df, test_sentiment_df, n_trials=0):
     study = optuna.create_study(direction="maximize")
     study.optimize(lambda trial: objective(trial, train_df, train_sentiment_df, test_df, test_sentiment_df), n_trials=n_trials, show_progress_bar=True)
@@ -650,11 +864,14 @@ def optimize_hyperparameters(train_df, train_sentiment_df, test_df, test_sentime
     print("Best total return: ", study.best_value)
 
     best_params = study.best_params
+
     env = make_vec_env(
         make_env(train_df, train_sentiment_df, 10000, 20, 0.03, 0.06),
         n_envs=4,
         vec_env_cls=SubprocVecEnv
     )
+
+    # configuring the model
     model = SAC(
         "MlpPolicy",
         env,
@@ -675,11 +892,17 @@ def optimize_hyperparameters(train_df, train_sentiment_df, test_df, test_sentime
 
     test_env = StockTradingEnv(test_df, test_sentiment_df, 10000, 20, 0.03, 0.06)
     backtest_model(model, test_env, test_df, test_sentiment_df, output_folder='backtest_results_final')
-    
+
+# main function to run the code
 def main():
+    # define stocks that the bot will trade
     tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN']
+
+    # time period for training the model
     training_start_date = '2020-01-01'
     training_end_date = '2024-01-01'
+
+    # time period for testing the model
     testing_start_date = '2024-01-01'
     testing_end_date = '2024-12-31'
 
